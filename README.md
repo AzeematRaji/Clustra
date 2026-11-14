@@ -1,2 +1,5 @@
 # Clustra
-multi-region AKS Store platform on Azure
+Multi-region AKS Store platform on Azure
+
+# Architecture 
+
