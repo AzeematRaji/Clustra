@@ -1,0 +1,30 @@
+# Terraform
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+
+# Real variable values are never committed; commit *.tfvars.example instead
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+!*.auto.tfvars.example
+
+# Local environment files (docker compose, app)
+.env
+.env.*
+!*.env.example
+
+# Editors and OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
