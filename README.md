@@ -10,7 +10,7 @@ Curious why Clustra exists and what it does? Check out [PROJECT.md](PROJECT.md).
 
 ## Architecture at a glance
 
-![Clustra architecture](docs/images/image.png)
+![Clustra architecture](docs/images/architecture.png)
 
 ## How it gets built
 
