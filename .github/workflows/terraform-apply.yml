@@ -1,0 +1,207 @@
+name: Terraform apply / destroy
+
+# Manual only. Plans one root (optionally narrowed to module/resource targets), then waits
+# for approval on the "production" environment before applying that exact plan.
+
+on:
+  workflow_dispatch:
+    inputs:
+      root:
+        description: Root to run against
+        required: true
+        type: choice
+        options:
+          - terraform/infrastructure/shared/acr
+          - terraform/infrastructure/environments/prod/region-1
+          - terraform/infrastructure/environments/prod/region-2
+          - terraform/infrastructure/shared/observability
+          - terraform/infrastructure/global/front-door
+      action:
+        description: apply, or destroy
+        required: true
+        type: choice
+        default: apply
+        options:
+          - apply
+          - destroy
+      target:
+        description: >-
+          Optional. Space-separated Terraform addresses to limit the run to,
+          e.g. module.documentdb. Leave empty for the whole root.
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+# Never run two operations against the same state at once.
+concurrency:
+  group: terraform-${{ inputs.root }}
+  cancel-in-progress: false
+
+env:
+  ARM_USE_OIDC: "true"
+  ARM_USE_AZUREAD: "true"
+  ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+  ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+  ROOT: ${{ inputs.root }}
+  ACTION: ${{ inputs.action }}
+  TARGET: ${{ inputs.target }}
+
+jobs:
+  plan:
+    name: Plan ${{ inputs.action }} (${{ inputs.root }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      has_changes: ${{ steps.plan.outputs.has_changes }}
+    steps:
+      - name: Check preconditions
+        env:
+          PASSPHRASE: ${{ secrets.TF_PLAN_PASSPHRASE }}
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::Run this workflow from main, so the applied code is the reviewed code."
+            exit 1
+          fi
+          if [ -z "$ARM_CLIENT_ID" ] || [ -z "$PASSPHRASE" ]; then
+            echo "::error::Azure OIDC variables (issue #11) or the TF_PLAN_PASSPHRASE secret are not configured."
+            exit 1
+          fi
+          for t in $TARGET; do
+            if ! echo "$t" | grep -Eq '^[A-Za-z0-9_.-]+(\[[A-Za-z0-9_"-]+\])?(\.[A-Za-z0-9_.-]+(\[[A-Za-z0-9_"-]+\])?)*$'; then
+              echo "::error::Invalid target address: $t"
+              exit 1
+            fi
+          done
+
+      - uses: actions/checkout@v4
+
+      - name: Read pinned Terraform version
+        id: tfver
+        run: echo "version=$(tr -d '[:space:]' < terraform/.terraform-version)" >> "$GITHUB_OUTPUT"
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ steps.tfver.outputs.version }}
+          terraform_wrapper: false
+
+      - name: terraform init
+        working-directory: ${{ inputs.root }}
+        run: |
+          key="${ROOT#terraform/infrastructure/}"
+          key="${key#environments/}.tfstate"
+          terraform init -input=false \
+            -backend-config="resource_group_name=${{ vars.TF_STATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TF_STATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ vars.TF_STATE_CONTAINER }}" \
+            -backend-config="key=$key" \
+            -backend-config="use_azuread_auth=true"
+
+      - name: terraform plan
+        id: plan
+        working-directory: ${{ inputs.root }}
+        run: |
+          args=(-input=false -no-color -lock-timeout=5m -detailed-exitcode -out=tfplan)
+          if [ "$ACTION" = "destroy" ]; then args+=(-destroy); fi
+          for t in $TARGET; do args+=("-target=$t"); done
+
+          set +e
+          terraform plan "${args[@]}"
+          code=$?
+          set -e
+
+          case $code in
+            0) echo "has_changes=false" >> "$GITHUB_OUTPUT" ;;
+            2) echo "has_changes=true" >> "$GITHUB_OUTPUT" ;;
+            *) exit $code ;;
+          esac
+
+      - name: Publish plan to run summary
+        working-directory: ${{ inputs.root }}
+        run: |
+          {
+            echo "## ${ACTION} plan: \`${ROOT}\`"
+            if [ -n "$TARGET" ]; then echo "Targets: \`${TARGET}\`"; fi
+            echo
+            echo '```'
+            terraform show -no-color tfplan | tail -c 900000
+            echo '```'
+            echo
+            echo "Review this plan before approving the apply job."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # The plan file can contain sensitive values, and artifacts on a public repo are
+      # readable by other users, so it is encrypted before upload.
+      - name: Encrypt plan
+        if: steps.plan.outputs.has_changes == 'true'
+        working-directory: ${{ inputs.root }}
+        env:
+          PASSPHRASE: ${{ secrets.TF_PLAN_PASSPHRASE }}
+        run: |
+          echo "$PASSPHRASE" | gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 \
+            --symmetric --cipher-algo AES256 -o tfplan.gpg tfplan
+          rm tfplan
+
+      - uses: actions/upload-artifact@v4
+        if: steps.plan.outputs.has_changes == 'true'
+        with:
+          name: tfplan
+          path: ${{ inputs.root }}/tfplan.gpg
+          retention-days: 1
+
+  apply:
+    name: Apply reviewed plan (${{ inputs.root }})
+    needs: plan
+    if: needs.plan.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+    # Required reviewers on this environment are the human approval gate.
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read pinned Terraform version
+        id: tfver
+        run: echo "version=$(tr -d '[:space:]' < terraform/.terraform-version)" >> "$GITHUB_OUTPUT"
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ steps.tfver.outputs.version }}
+          terraform_wrapper: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: tfplan
+          path: ${{ inputs.root }}
+
+      - name: Decrypt plan
+        working-directory: ${{ inputs.root }}
+        env:
+          PASSPHRASE: ${{ secrets.TF_PLAN_PASSPHRASE }}
+        run: |
+          echo "$PASSPHRASE" | gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 \
+            -o tfplan -d tfplan.gpg
+          rm tfplan.gpg
+
+      - name: terraform init
+        working-directory: ${{ inputs.root }}
+        run: |
+          key="${ROOT#terraform/infrastructure/}"
+          key="${key#environments/}.tfstate"
+          terraform init -input=false \
+            -backend-config="resource_group_name=${{ vars.TF_STATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TF_STATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ vars.TF_STATE_CONTAINER }}" \
+            -backend-config="key=$key" \
+            -backend-config="use_azuread_auth=true"
+
+      - name: terraform apply
+        working-directory: ${{ inputs.root }}
+        run: terraform apply -input=false -no-color -lock-timeout=5m tfplan

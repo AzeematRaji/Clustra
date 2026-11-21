@@ -12,6 +12,7 @@ Created when there is content to put in them; listed here so the shape is agreed
 | `decisions/` | Lightweight ADRs recording material decisions and the reasoning behind them. |
 | `diagrams/` | Architecture and network diagrams in a diffable format, not binary screenshots. |
 | `networking/` | VNet address plans, subnet tables, peering intent, DNS resolution and NSG rules. |
+| `terraform/` | How the Terraform roots depend on each other: hand-offs, apply and destroy order. |
 | `testing/` | Failure-injection and recovery exercise records, with observed routing behaviour, latency, replication lag, RTO and RPO. |
 
 ## Rules
