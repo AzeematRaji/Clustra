@@ -1,0 +1,185 @@
+name: Terraform PR checks
+
+# fmt and validate every changed root; plan the changed production roots.
+# The plan job stays skipped until Azure OIDC is configured (repo variable AZURE_CLIENT_ID).
+
+on:
+  pull_request:
+    paths:
+      - "terraform/**"
+      - ".github/workflows/terraform-pr.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: terraform-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    name: Find changed roots
+    runs-on: ubuntu-latest
+    outputs:
+      roots: ${{ steps.roots.outputs.roots }}
+      plan_roots: ${{ steps.roots.outputs.plan_roots }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: roots
+        name: Map changed files to roots
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          # Roots are the directories under terraform/infrastructure that contain .tf files.
+          all_roots=$(find terraform/infrastructure -name '*.tf' -exec dirname {} \; | sort -u)
+          changed=$(git diff --name-only "$BASE_SHA"...HEAD -- terraform)
+
+          if echo "$changed" | grep -q '^terraform/modules/'; then
+            # A module change can affect any root.
+            roots="$all_roots"
+          else
+            roots=""
+            for r in $all_roots; do
+              if echo "$changed" | grep -q "^$r/"; then
+                roots="$roots $r"
+              fi
+            done
+          fi
+
+          # Staging is not deployed, so it is checked but never planned.
+          plan_roots=$(echo "$roots" | tr ' ' '\n' | grep -v '/staging/' || true)
+
+          to_json() { echo "$1" | tr ' ' '\n' | grep -v '^$' | jq -R . | jq -sc .; }
+          echo "roots=$(to_json "$roots")" >> "$GITHUB_OUTPUT"
+          echo "plan_roots=$(to_json "$plan_roots")" >> "$GITHUB_OUTPUT"
+          echo "Changed roots: ${roots:-none}"
+
+  check:
+    name: fmt and validate (${{ matrix.root }})
+    needs: changes
+    if: needs.changes.outputs.roots != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        root: ${{ fromJson(needs.changes.outputs.roots) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read pinned Terraform version
+        id: tfver
+        run: |
+          f=terraform/.terraform-version
+          if [ ! -f "$f" ]; then
+            echo "::error file=$f::Missing pinned Terraform version (issue #5)."
+            exit 1
+          fi
+          echo "version=$(tr -d '[:space:]' < "$f")" >> "$GITHUB_OUTPUT"
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ steps.tfver.outputs.version }}
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive -diff
+        working-directory: ${{ matrix.root }}
+
+      - name: terraform init (no backend)
+        run: terraform init -backend=false -input=false
+        working-directory: ${{ matrix.root }}
+
+      - name: terraform validate
+        run: terraform validate -no-color
+        working-directory: ${{ matrix.root }}
+
+  plan:
+    name: plan (${{ matrix.root }})
+    needs:
+      - changes
+      - check
+    # Needs OIDC (issue #11), and never runs for fork PRs, which get no Azure credentials.
+    if: >-
+      needs.changes.outputs.plan_roots != '[]' &&
+      vars.AZURE_CLIENT_ID != '' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+    strategy:
+      fail-fast: false
+      matrix:
+        root: ${{ fromJson(needs.changes.outputs.plan_roots) }}
+    env:
+      ARM_USE_OIDC: "true"
+      ARM_USE_AZUREAD: "true"
+      ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read pinned Terraform version
+        id: tfver
+        run: echo "version=$(tr -d '[:space:]' < terraform/.terraform-version)" >> "$GITHUB_OUTPUT"
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ steps.tfver.outputs.version }}
+          terraform_wrapper: false
+
+      - name: Derive backend key
+        id: key
+        run: |
+          # terraform/infrastructure/environments/prod/region-1 -> prod/region-1.tfstate
+          k="${{ matrix.root }}"
+          k="${k#terraform/infrastructure/}"
+          k="${k#environments/}"
+          echo "key=$k.tfstate" >> "$GITHUB_OUTPUT"
+
+      - name: terraform init
+        working-directory: ${{ matrix.root }}
+        run: >-
+          terraform init -input=false
+          -backend-config="resource_group_name=${{ vars.TF_STATE_RESOURCE_GROUP }}"
+          -backend-config="storage_account_name=${{ vars.TF_STATE_STORAGE_ACCOUNT }}"
+          -backend-config="container_name=${{ vars.TF_STATE_CONTAINER }}"
+          -backend-config="key=${{ steps.key.outputs.key }}"
+          -backend-config="use_azuread_auth=true"
+
+      - name: terraform plan
+        id: plan
+        working-directory: ${{ matrix.root }}
+        run: |
+          set +e
+          terraform plan -input=false -no-color -lock-timeout=5m -out=tfplan > plan.txt 2>&1
+          code=$?
+          set -e
+          cat plan.txt
+          exit $code
+
+      - name: Comment plan on PR
+        if: always() && steps.plan.outcome != 'skipped'
+        working-directory: ${{ matrix.root }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OUTCOME: ${{ steps.plan.outcome }}
+        run: |
+          {
+            echo "### Terraform plan: \`${{ matrix.root }}\` (${OUTCOME})"
+            echo
+            echo '<details><summary>Show plan</summary>'
+            echo
+            echo '```'
+            # GitHub comments are limited to 65,536 characters.
+            tail -c 60000 plan.txt
+            echo '```'
+            echo '</details>'
+            echo
+            echo "Review for replacements, deletions, public exposure and cross-root impact before merging."
+          } > comment.md
+          gh pr comment "${{ github.event.pull_request.number }}" --body-file comment.md
