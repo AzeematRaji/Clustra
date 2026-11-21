@@ -21,6 +21,14 @@ terraform/
 - Never commit state, plan files or real `.tfvars` values. See the repository root `.gitignore`.
 - Bootstrap the state backend before the first root is applied.
 
+## Conventions
+
+All roots and modules follow the [naming, tagging and resource-group conventions](../docs/conventions/naming-and-tagging.md):
+
+- Names: `<type>-clustra-<env>-<region>[-<purpose>]`
+- Tags on every resource: `project`, `environment`, `region`, `managed-by`, `owner`
+- One resource group per root (plus a data group for the DocumentDB pair); a root never creates resources in another root's group
+
 ## Order of work
 
 See `PLAN.md`. Bootstrap first, then shared services, then regional environments, then the global root that points at them.
