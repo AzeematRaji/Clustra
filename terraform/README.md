@@ -29,6 +29,14 @@ All roots and modules follow the [naming, tagging and resource-group conventions
 - Tags on every resource: `project`, `environment`, `region`, `managed-by`, `owner`
 - One resource group per root (plus a data group for the DocumentDB pair); a root never creates resources in another root's group
 
+## Versions
+
+Every root uses the same Terraform and provider constraints, documented in [Terraform and provider version constraints](../docs/conventions/terraform-versions.md):
+
+- Terraform `~> 1.17.0`
+- `hashicorp/azurerm` `~> 5.12`
+- `.terraform.lock.hcl` is committed in every root
+
 ## Order of work
 
 See `PLAN.md`. Bootstrap first, then shared services, then regional environments, then the global root that points at them.
